@@ -17,6 +17,8 @@ class SudokuAI(competitive_sudoku.sudokuai.SudokuAI):
 
     def __init__(self):
         super().__init__()
+        self.zobrist_table = {}  # Will be initialized per game
+        self.transposition_table = {}  # Cache: hash -> (depth, score)
 
     def compute_best_move(self, game_state: GameState) -> None:
         N = game_state.board.N
@@ -31,6 +33,25 @@ class SudokuAI(competitive_sudoku.sudokuai.SudokuAI):
         print(heur_desired_x, heur_desired_y)
         if game_state.current_player == 2:
             heur_desired_y = 0
+
+        # Initialize Zobrist table for this game (if not already done for this N)
+        if N not in self.zobrist_table:
+            self.zobrist_table[N] = {}
+            for i in range(N):
+                for j in range(N):
+                    self.zobrist_table[N][(i, j)] = {}
+                    for value in range(1, N + 1):
+                        self.zobrist_table[N][(i, j)][value] = random.getrandbits(64)
+        
+        def get_board_hash(state):
+            """Compute Zobrist hash for board state"""
+            h = 0
+            for i in range(N):
+                for j in range(N):
+                    val = state.board.get((i, j))
+                    if val != SudokuBoard.empty:
+                        h ^= self.zobrist_table[N][(i, j)][val]
+            return h
 
         def score_move(i, j, val, for_state):
             def check_vertical():
@@ -54,7 +75,7 @@ class SudokuAI(competitive_sudoku.sudokuai.SudokuAI):
                 region_i = int(i / rh)
                 region_j = int(j / rw)
                 for ri in range(region_i * rh, (region_i + 1) * rh):
-                    for rj in range(region_j * rh, (region_j + 1) * rh):
+                    for rj in range(region_j * rw, (region_j + 1) * rw):  # FIX: was rh, should be rw
                         if for_state.board.get((ri, rj)) == SudokuBoard.empty:
                             return False
                 return True
@@ -65,14 +86,18 @@ class SudokuAI(competitive_sudoku.sudokuai.SudokuAI):
                 regions_completed += 1
             if check_region():
                 regions_completed += 1
+            
+            # CRITICAL: Heavily weight multi-region completions
+            # Actual game scoring: 0→0, 1→1, 2→3, 3→7
+            # But for AI evaluation, we want MUCH higher preference for multi-completions
             if regions_completed == 0:
                 return 0
             elif regions_completed == 1:
                 return 1
             elif regions_completed == 2:
-                return 3
+                return 10  # Much higher weight than game score (3)
             elif regions_completed == 3:
-                return 7
+                return 100  # EXTREME weight vs game score (7)
             else:
                 raise Exception("completed > 3 regions in one go during scoring")
 
@@ -113,6 +138,13 @@ class SudokuAI(competitive_sudoku.sudokuai.SudokuAI):
             new_state = copy.deepcopy(from_state)
             new_state.board.put(sq, val)
             new_state.moves.append(Move(square=sq, value=val))
+            
+            # CRITICAL FIX: Initialize occupied_squares if None
+            if new_state.occupied_squares1 is None:
+                new_state.occupied_squares1 = []
+            if new_state.occupied_squares2 is None:
+                new_state.occupied_squares2 = []
+            
             if from_state.current_player == 1:
                 new_state.current_player = 2
                 new_state.occupied_squares1.append(sq)
@@ -208,30 +240,86 @@ class SudokuAI(competitive_sudoku.sudokuai.SudokuAI):
                 else:
                     score -= move_scoring
                     # print("   scoring ", last_move, " negatively")
+            
+            # CRITICAL: Evaluate opponent threats (can they score next turn?)
+            opponent_player = 2 if game_state.current_player == 1 else 1
+            opponent_threats = 0
+            
+            # Check each row/col/region for near-completion by opponent
+            # A row/col/region with N-1 opponent squares is a threat
+            opponent_sqs = for_state.occupied_squares2 if opponent_player == 2 else for_state.occupied_squares1
+            if opponent_sqs:
+                # Count opponent dominance in rows/cols/regions
+                for row_idx in range(N):
+                    opp_in_row = sum(1 for (r, c) in opponent_sqs if r == row_idx)
+                    if opp_in_row >= N - 2:  # Close to completion
+                        opponent_threats += 0.5
+                
+                for col_idx in range(N):
+                    opp_in_col = sum(1 for (r, c) in opponent_sqs if c == col_idx)
+                    if opp_in_col >= N - 2:
+                        opponent_threats += 0.5
+            
+            score -= opponent_threats * 2.0  # Penalty for opponent threats
+            
+            # Add candidate-based evaluation
+            constraint_score = 0
+            for i in range(N):
+                for j in range(N):
+                    if for_state.board.get((i, j)) == SudokuBoard.empty:
+                        # Count legal values for this cell
+                        candidates = sum(1 for v in range(1, N + 1) if possible(i, j, v, for_state))
+                        if candidates == 0:  # Dead end!
+                            return float('-inf')
+                        elif candidates == 1:  # Naked single - very good!
+                            constraint_score += 2.0
+                        elif candidates == 2:  # Nearly forced
+                            constraint_score += 0.5
+            
+            score += constraint_score
+            
             return score
 
         def get_possible_moves(from_state: GameState):
-            """optimized previous version; generate all legal moves for the current player from this state"""
+            """Generate all legal moves, ordered by quality (best first for alpha-beta)"""
             player_squares = from_state.player_squares()
             if player_squares is None:
-                candidates = [(i, j) for i in range(N) for j in range(N)]
+                candidates = [(i, j) for i in range(N) for j in range(N)
+                              if from_state.board.get((i, j)) == SudokuBoard.empty]
             else:
                 candidates = player_squares
 
-            return [
-                Move((i, j), value)
-                for (i, j) in candidates
-                for value in range(1, N + 1)
-                if possible(i, j, value, from_state)
-            ]
+            # Generate moves with scores for ordering
+            scored_moves = []
+            for (i, j) in candidates:
+                for value in range(1, N + 1):
+                    if possible(i, j, value, from_state):
+                        # Quick evaluation: score immediate completion
+                        quick_score = score_move(i, j, value, from_state)
+                        scored_moves.append((quick_score, Move((i, j), value)))
+            
+            # Sort by score descending (best moves first)
+            scored_moves.sort(reverse=True, key=lambda x: x[0])
+            
+            return [move for (_, move) in scored_moves]
 
         def string_state(depth, state):
             return f"State({depth} {[str(mov) for mov in state.moves[-depth:]]})"
 
         def rec_search_minimax(state, depth, alpha, beta, is_max_player):
-            """Implementation based wikipedia pseudocode"""
+            """Implementation based wikipedia pseudocode with transposition table"""
+            # Check transposition table
+            board_hash = get_board_hash(state)
+            if board_hash in self.transposition_table:
+                cached_depth, cached_score = self.transposition_table[board_hash]
+                if cached_depth >= (to_depth - depth):  # Deeper or equal remaining search
+                    return cached_score, state
+            
             if depth == to_depth:
-                return score_state(state, depth=depth), state
+                score = score_state(state, depth=depth)
+                # Store in transposition table
+                self.transposition_table[board_hash] = (to_depth - depth, score)
+                return score, state
 
             # print("SEARCH, AT ", string_state(depth, state))
 
@@ -277,8 +365,16 @@ class SudokuAI(competitive_sudoku.sudokuai.SudokuAI):
             # no legal moves -> let framework handle "cannot move" case
             return
 
-        # quick fallback: propose a random legal move immediately
-        fallback_move = random.choice(legal_root_moves)
+        # CRITICAL FIX: Choose greedy best move as fallback, not random!
+        best_fallback = None
+        best_score = float('-inf')
+        for move in legal_root_moves:
+            move_score = score_move(move.square[0], move.square[1], move.value, root)
+            if move_score > best_score:
+                best_score = move_score
+                best_fallback = move
+        
+        fallback_move = best_fallback if best_fallback else random.choice(legal_root_moves)
         self.propose_move(fallback_move)
 
         print("BEGIN SEARCH")
